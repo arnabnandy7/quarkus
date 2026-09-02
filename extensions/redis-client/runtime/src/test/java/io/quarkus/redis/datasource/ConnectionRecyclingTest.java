@@ -1,14 +1,22 @@
 package io.quarkus.redis.datasource;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 import java.time.Duration;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import io.quarkus.redis.runtime.datasource.BlockingRedisDataSourceImpl;
 import io.quarkus.redis.runtime.datasource.ReactiveRedisDataSourceImpl;
+import io.smallrye.mutiny.Uni;
+import io.smallrye.mutiny.subscription.Cancellable;
+import io.vertx.mutiny.redis.client.Redis;
+import io.vertx.mutiny.redis.client.RedisAPI;
+import io.vertx.mutiny.redis.client.RedisConnection;
+import io.vertx.redis.client.RedisOptions;
 
 public class ConnectionRecyclingTest extends DatasourceTestBase {
 
@@ -40,5 +48,70 @@ public class ConnectionRecyclingTest extends DatasourceTestBase {
         }
 
         assertThat(rds.value(String.class, Integer.class).get(k).await().indefinitely()).isEqualTo(1000);
+    }
+
+    @Test
+    void verifyThatConnectionsAreClosedWhenAcquisitionIsCancelled() {
+        Redis limitedRedis = createLimitedRedisClient();
+        RedisConnection occupiedConnection = limitedRedis.connect().await().indefinitely();
+        AtomicBoolean functionInvoked = new AtomicBoolean();
+
+        try {
+            ReactiveRedisDataSource limitedDataSource = new ReactiveRedisDataSourceImpl(vertx, limitedRedis,
+                    RedisAPI.api(limitedRedis));
+            Cancellable cancellable = limitedDataSource.withConnection(connection -> {
+                functionInvoked.set(true);
+                return Uni.createFrom().voidItem();
+            }).subscribe().with(ignored -> {
+            });
+
+            cancellable.cancel();
+            occupiedConnection.closeAndAwait();
+
+            RedisConnection recycledConnection = limitedRedis.connect()
+                    .ifNoItem().after(Duration.ofSeconds(5)).fail()
+                    .await().indefinitely();
+            recycledConnection.closeAndAwait();
+            assertThat(functionInvoked).isFalse();
+        } finally {
+            limitedRedis.closeAndAwait();
+        }
+    }
+
+    @Test
+    void verifyThatConnectionsAreClosedWhenActionIsCancelled() {
+        Redis limitedRedis = createLimitedRedisClient();
+        AtomicBoolean functionInvoked = new AtomicBoolean();
+        AtomicBoolean functionCancelled = new AtomicBoolean();
+
+        try {
+            ReactiveRedisDataSource limitedDataSource = new ReactiveRedisDataSourceImpl(vertx, limitedRedis,
+                    RedisAPI.api(limitedRedis));
+            Cancellable cancellable = limitedDataSource.withConnection(connection -> {
+                functionInvoked.set(true);
+                return Uni.createFrom().<Void> nothing()
+                        .onCancellation().invoke(() -> functionCancelled.set(true));
+            }).subscribe().with(ignored -> {
+            });
+
+            await().atMost(Duration.ofSeconds(5)).untilTrue(functionInvoked);
+            cancellable.cancel();
+            await().atMost(Duration.ofSeconds(5)).untilTrue(functionCancelled);
+
+            RedisConnection recycledConnection = limitedRedis.connect()
+                    .ifNoItem().after(Duration.ofSeconds(5)).fail()
+                    .await().indefinitely();
+            recycledConnection.closeAndAwait();
+        } finally {
+            limitedRedis.closeAndAwait();
+        }
+    }
+
+    private Redis createLimitedRedisClient() {
+        return Redis.createClient(vertx, new RedisOptions()
+                .setConnectionString(
+                        "redis://" + RedisServerExtension.getHost() + ":" + RedisServerExtension.getFirstMappedPort())
+                .setMaxPoolSize(1)
+                .setMaxPoolWaiting(2));
     }
 }
